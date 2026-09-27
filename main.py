@@ -22,6 +22,7 @@ import shutil
 import struct
 import logging
 import argparse
+import binascii
 from tqdm import tqdm
 from io import BytesIO
 from pathlib import Path
@@ -38,10 +39,15 @@ from compression.zstd import decompress as ZSTD_uncompress
 
 from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 
+# addappid(813230, 1, "0a27e705...") -- ANIMAL WELL
+LUA_ADDAPPID_RE = re.compile(
+    r'^[ \t]*addappid[ \t]*\([ \t]*(\d+)[ \t]*(?:,[ \t]*\d+[ \t]*)?(?:,[ \t]*"([0-9a-fA-F]*)"[ \t]*)?\)[ \t]*(?:--[ \t]*(.*?))?[ \t]*$',
+    re.MULTILINE)
+
 parser = argparse.ArgumentParser(
     add_help=True,
     description='Depot Downloader, write in Python.',
-    epilog=f"Use Ctrl+C to cancel the download, double-tap to cancel all downloads. GIL: {sys._is_gil_enabled()}")
+    epilog=f"Use Ctrl+C to cancel the download, press it again to force quit. GIL: {sys._is_gil_enabled()}")
 
 parser.add_argument('-r', '--retry', type=int, default=5,
     help='how many retries for downloading a chunk, default 5')
@@ -81,28 +87,41 @@ conn_group.add_argument('--use-websocket', action='store_true',
 subparsers = parser.add_subparsers(dest='command', required=True,
     help='command')
 
-app_parser = subparsers.add_parser('app')
+app_parser = subparsers.add_parser('app',
+    help='download every manifest found in a directory')
 app_parser.add_argument('-p', '--app-path', type=str, required=True)
 
-depot_parser = subparsers.add_parser('depot')
+depot_parser = subparsers.add_parser('depot',
+    help='download specific manifests')
 depot_parser.add_argument('-m', '--manifest-path', type=str, dest='manifest_path_list', action='extend', nargs='+', required=True)
 depot_parser.add_argument('-k', '--depot-key', type=str, dest='depot_key_list', action='extend', nargs='+', required=True)
 
-args = parser.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    parsed_args = parser.parse_args(argv)
 
-DEFAULT_PARAMS['https'] = not args.use_http
 
-try:
-    DEFAULT_PARAMS['apihost'] = APIHost[args.api_host].value
-except:
-    DEFAULT_PARAMS['apihost'] = args.api_host
+    DEFAULT_PARAMS['https'] = not parsed_args.use_http
 
-# China apihost only support websocket
-if DEFAULT_PARAMS['apihost'] == APIHost.China.value:
-    args.use_websocket = True
+    try:
+        DEFAULT_PARAMS['apihost'] = APIHost[parsed_args.api_host].value
+    except KeyError:
+        DEFAULT_PARAMS['apihost'] = parsed_args.api_host
+
+    # China apihost only support websocket
+    if DEFAULT_PARAMS['apihost'] == APIHost.China.value:
+        parsed_args.use_websocket = True
+
+    # webapi.get/post bind apihost and https as default arguments when steam is
+    # imported, the CM server list bootstrap of the library needs them patched
+    for webapi_func in (webapi.get, webapi.post):
+        webapi_func.__defaults__ = (1, DEFAULT_PARAMS['apihost'], DEFAULT_PARAMS['https'],
+                                    None, None, None)
+
+    return parsed_args
 
 from steam.enums import EResult
 from steam.exceptions import SteamError
+from steam import webapi
 from steam.webapi import get as webapi_get
 from steam.client import SteamClient
 from steam.client.cdn import CDNClient
@@ -135,6 +154,26 @@ else:
         termios.tcsetattr(fd, termios.TCSANOW, original_settings)
     atexit.register(restore_terminal)
 
+def remove_path(path:Path, log:logging.Logger=None):
+    """Remove a file, a symlink or an empty directory.
+
+    A symlink is never followed, and a symlink pointing to a directory has to be
+    removed with rmdir on Windows, unlink() raises PermissionError for it.
+    """
+    if path.is_symlink():
+        if path.is_dir():
+            path.rmdir()
+        else:
+            path.unlink()
+    elif path.is_dir():
+        try:
+            path.rmdir()
+        except OSError as exp:
+            if log:
+                log.warning(f"Failed to remove directory '{path}': {exp}")
+    elif path.exists():
+        path.unlink()
+
 class FileDownload:
     def __init__(self, depot_downloader:DepotDownloader, depot_file:DepotFile, save_path=None):
         self.depot_downloader = depot_downloader
@@ -151,7 +190,9 @@ class FileDownload:
             if self.file_path.exists():
                 if verify_integrity:
                     self.log.debug(f"Verifying integrity of {filename}...")
-                    if depot_file.size and file_digest(self.file_path.open('rb'), 'sha1').digest() != depot_file.sha_content:
+                    with self.file_path.open('rb') as file:
+                        digest = file_digest(file, 'sha1').digest()
+                    if depot_file.size and digest != depot_file.sha_content:
                         self.log.warning(f"File '{self.file_path}' exists but integrity check failed, redownloading.")
                         chunk_dict[filename.as_posix()] = []
 
@@ -174,13 +215,15 @@ class FileDownload:
             self.file_path.mkdir(parents=True, exist_ok=True)
 
         elif depot_file.is_symlink:
-            if self.file_path.exists():
-                self.file_path.unlink()
+            remove_path(self.file_path, self.log)
 
             linktarget = Path(depot_file.linktarget)
-            self.file_path.symlink_to(
-                linktarget.as_posix(),
-                target_is_directory=True if linktarget.is_dir() else False)
+            try:
+                self.file_path.symlink_to(
+                    linktarget.as_posix(),
+                    target_is_directory=True if linktarget.is_dir() else False)
+            except OSError as exp:
+                self.log.warning(f"Failed to create symlink '{self.file_path}' -> '{linktarget}': {exp}")
 
         if depot_file.is_executable:
             self.file_path.chmod(self.file_path.stat().st_mode | 0o111)  # Add execute permissions
@@ -195,7 +238,7 @@ class FileDownload:
     def download_chunk_and_save(self, chunk, max_attempts=5):
         chunk_id = chunk.sha.hex()
         self.depot_downloader.tqdm.set_postfix_str(
-            self.file_path.as_posix()[-(shutil.get_terminal_size().columns // 4):])
+            self.file_path.as_posix()[-max(1, shutil.get_terminal_size().columns // 4):])
         data = self.get_chunk(chunk_id, max_attempts)
         with self.lock, self.file_path.open('rb+') as file:
             file.seek(chunk.offset, 0)
@@ -237,7 +280,7 @@ class FileDownload:
                         crc32_footer = struct.unpack_from('<I', data, -15)[0]
                         size_decompressed = struct.unpack_from('<I', data, -11)[0]
                         data = ZSTD_uncompress(data[8 : -15])[:size_decompressed]
-                        if crc32(data) != crc32_header != crc32_footer:
+                        if crc32(data) != crc32_header or crc32_header != crc32_footer:
                             raise SteamError("%s %s VSZ: CRC32 checksum doesn't match for decompressed data" % (self.file_path, chunk_id))
                     else:
                         with ZipFile(BytesIO(data)) as zf:
@@ -247,7 +290,7 @@ class FileDownload:
                 elif resp.status_code == 403:
                     # token missing maybe?
                     raise SteamError(f'{server}: {resp}')
-                elif 400 <= resp.status_code < 500:
+                else:
                     raise SteamError("%s %s HTTP Error %s" % (self.file_path, chunk_id, resp.status_code))
             except Exception as exp:
                 self.log.debug("%s %s Request error (attempt %d/%d): %s",
@@ -267,7 +310,8 @@ class SingletonDeque(deque):
     _initialized = False
 
     def __new__(cls, *args, **kwargs):
-        if not cls._instance:
+        # an empty deque is falsy, so compare against None
+        if cls._instance is None:
             cls._instance = super().__new__(cls, *args, **kwargs)
         return cls._instance
 
@@ -293,9 +337,9 @@ class SingletonDeque(deque):
         with self._lock:
             return super().popleft()
 
-    def remove(self):
+    def remove(self, value):
         with self._lock:
-            return super().remove()
+            return super().remove(value)
 
     def __len__(self):
         with self._lock:
@@ -335,6 +379,11 @@ class TqdmLoggingHandler(logging.Handler):
         msg = self.format(record)
         tqdm.write(msg)
 
+def setup_logging(level=logging.INFO):
+    logging.basicConfig(format='%(levelname)s: %(message)s',
+                        level=level,
+                        handlers=[TqdmLoggingHandler()])
+
 class DepotDownloader:
     def __init__(self, manifest: DepotManifest, depot_key: bytes, *,
                  app_id=0,
@@ -343,7 +392,7 @@ class DepotDownloader:
                  retry_num=5,
                  max_servers=20,
                  cdn_client:CDNClient=None,
-                 custom_servers:Iterable[str]=[],
+                 custom_servers:Iterable[str]=None,
                  save_path:os.PathLike=None,
                  verify_integrity=False,
                  level=logging.INFO):
@@ -361,15 +410,15 @@ class DepotDownloader:
         self.thread_num = int(thread_num)
         self.max_servers = int(max_servers)
         self.log = logging.getLogger(self.__class__.__name__)
-        logging.basicConfig(format='%(levelname)s: %(message)s',
-                            level=level,
-                            handlers=[TqdmLoggingHandler()])
+        setup_logging(level)
         self.chunk_dict_path = self._get_chunk_saves()
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
         try:
             with self.lock, self.chunk_dict_path.open(encoding='utf-8') as f:
                 self.chunk_dict:dict = json.load(f)
-        except json.decoder.JSONDecodeError:
+            if not isinstance(self.chunk_dict, dict):
+                raise ValueError
+        except (json.decoder.JSONDecodeError, UnicodeDecodeError, FileNotFoundError, ValueError):
             self.chunk_dict = dict()
         self.web = make_requests_session()
         self.web.headers['Cache-Control'] = 'no-cache'
@@ -402,7 +451,10 @@ class DepotDownloader:
         if matching_files:
             chunk_saves = matching_files.pop()
             for file in matching_files:
-                file.unlink()
+                try:
+                    file.unlink()
+                except OSError as exp:
+                    self.log.debug(f"Failed to remove '{file}': {exp}")
 
         if not chunk_saves:
             chunk_saves = Path(f'{self.depot_id} - 0%.json')
@@ -410,20 +462,19 @@ class DepotDownloader:
 
         return chunk_saves
 
-    def get_content_server(self, rotate=False, fetch_all_cdn_token=False, cell_id=0, custom_servers:Iterable[str]=[]):
+    def get_content_server(self, rotate=False, fetch_all_cdn_token=False, cell_id=0, custom_servers:Iterable[str]=None):
         if custom_servers:
             for server_str in map(str, custom_servers):
                 if server_str not in self.servers:
                     self.servers.append(server_str)
 
         if not self.servers:
-            try:
-                resp = webapi_get('IContentServerDirectoryService', 'GetServersForSteamPipe',
-                                  params={'cell_id': cell_id or self.cell_id, 'max_servers': self.max_servers})
-                content_servers = resp['response']['servers']
-                content_servers.sort(key=lambda x: (x['type'] != 'CDN', x['priority_class']))
-            except Exception:
-                raise
+            resp = webapi_get('IContentServerDirectoryService', 'GetServersForSteamPipe',
+                              params={'cell_id': cell_id or self.cell_id, 'max_servers': self.max_servers},
+                              https=DEFAULT_PARAMS['https'],
+                              apihost=DEFAULT_PARAMS['apihost'])
+            content_servers = resp['response']['servers']
+            content_servers.sort(key=lambda x: (x['type'] != 'CDN', x['priority_class']))
 
             for server in filter(lambda x: not (
                 x['type'] == 'OpenCache' or x.get('steam_china_only', False)
@@ -446,24 +497,25 @@ class DepotDownloader:
             if fetch_all_cdn_token:
                 for server in self.servers:
                     self.cdn.get_cdn_auth_token(self.app_id, self.depot_id, parse_url(server).host)
-            while True:
+            while self.servers:
                 result:dict = self.cdn.get_cdn_auth_token(self.app_id, self.depot_id, parse_url(server_str).host)
                 if result['eresult'] in (EResult.OK, EResult.Fail): # Fail means token unneeded seems
                     token = result['token']
                     break
-                else:
+                self.log.warning(f'Removed server: {server_str}\nBecause error code {result['eresult']} when try to get cdn auth token.')
+                if server_str in self.servers: # another thread may have removed it already
                     self.servers.remove(server_str)
-                    self.log.warning(f'Removed server: {server_str}\nBecause error code {result['eresult']} when try to get cdn auth token.')
+                if self.servers:
                     server_str = self.servers[0]
+
+            if not self.servers:
+                raise SteamError("Failed to get cdn auth token for any content server")
 
         return server_str, token
 
-    def discard_paths_in_manifest(self, paths_in_dir:set[str]=set()):
-        for depot_file in self.manifest:
-            posix_filename = Path(depot_file.filename).as_posix()
-            paths_in_dir.discard(posix_filename)
-
-    def download(self, pattern:str='', paths_in_dir:set[str]=set()):
+    def download(self, pattern:str='', paths_in_dir:set[str]=None):
+        if paths_in_dir is None:
+            paths_in_dir = set()
         executor = ThreadPoolExecutor(max_workers=self.thread_num)
         try:
             compiled_pattern = re.compile(pattern)
@@ -477,7 +529,7 @@ class DepotDownloader:
 
                 if posix_filename in self.chunk_dict:
                     self.tqdm.set_postfix_str(
-                        posix_filename[-(shutil.get_terminal_size().columns // 4):])
+                        posix_filename[-max(1, shutil.get_terminal_size().columns // 4):])
 
                 file_downloader = FileDownload(self, depot_file)
 
@@ -504,7 +556,7 @@ class DepotDownloader:
                 _ = f.result()
         except KeyboardInterrupt:
             tqdm.write(f'Depot {self.depot_id}: cancelled')
-            self.discard_paths_in_manifest(paths_in_dir)
+            raise
         except Exception:
             tqdm.write(f'Depot {self.depot_id}: failed')
             raise
@@ -522,12 +574,13 @@ class DepotDownloader:
             #time.sleep(1) # wait for another KeyboardInterrupt to cancell all download
 
     def _handle_chunk_result(self, future:Future, chunk_key, chunk_size, path:str):
-        if future.cancelled():
+        # a chunk that raised is not downloaded, it must be retried on the next run
+        if future.cancelled() or future.exception() is not None:
             return
         self.tqdm.update(chunk_size)
         with self.lock:
-            self.chunk_dict[path].append(chunk_key)
-            percentage = int(round(self.tqdm.n / self.tqdm.total * 100))
+            self.chunk_dict.setdefault(path, []).append(chunk_key)
+            percentage = int(round(self.tqdm.n / self.tqdm.total * 100)) if self.tqdm.total else 0
             new_name = f"{self.depot_id} - {percentage}%.json"
             if self.chunk_dict_path.name != new_name:
                 self.save_chunk_dict()
@@ -537,37 +590,77 @@ class DepotDownloader:
     def save_chunk_dict(self):
         try:
             chunk_dict_for_save = self.chunk_dict.copy()
-            with self.chunk_dict_path.open('r+', encoding='utf-8') as f:
+            # write then rename, an interrupted save must not corrupt the resume data
+            tmp_path = self.chunk_dict_path.with_name(self.chunk_dict_path.name + '.tmp')
+            with tmp_path.open('w', encoding='utf-8') as f:
                 json.dump(chunk_dict_for_save, f)
-                f.truncate()
+            tmp_path.replace(self.chunk_dict_path)
         except KeyboardInterrupt:
             pass
 
-def app_path_parser(app_path:os.PathLike) -> tuple[list[DepotManifest], dict[int,bytes]]:
+def vdf_key_parser(vdf_path:Path) -> dict[int,bytes]:
+    depot_keys:dict[int,bytes] = {}
+    with vdf_path.open(encoding='utf-8') as f:
+        d = vdf.load(f)
+    for depot_id, depot in d.get('depots', {}).items():
+        depot_key = depot.get('DecryptionKey')
+        if not depot_key:
+            continue
+        if not re.fullmatch(r'[0-9a-fA-F]{2,64}', depot_key):
+            raise SteamError(f"Invalid DecryptionKey for depot {depot_id} in '{vdf_path}'")
+        depot_keys[int(depot_id)] = unhexlify(depot_key)
+    return depot_keys
+
+def lua_key_parser(lua_path:Path) -> tuple[int, dict[int,bytes]]:
+    """Read the depot keys of a steamcmd app_info lua file.
+
+    Returns the app id, the first addappid of the file, and the depot keys.
+    """
+    text = lua_path.read_text(encoding='utf-8', errors='replace')
+
+    app_id = 0
+    depot_keys:dict[int,bytes] = {}
+    for depot_id, depot_key, _ in LUA_ADDAPPID_RE.findall(text):
+        depot_id = int(depot_id)
+        if not app_id: # the app itself is the first addappid
+            app_id = depot_id
+        if depot_key: # an empty key means the depot has no content
+            if not re.fullmatch(r'[0-9a-fA-F]{2,64}', depot_key):
+                raise SteamError(f"Invalid depot key for depot {depot_id} in '{lua_path}'")
+            depot_keys[depot_id] = unhexlify(depot_key)
+
+    return app_id, depot_keys
+
+def app_path_parser(app_path:os.PathLike) -> tuple[list[DepotManifest], dict[int,bytes], int]:
     path = Path(app_path)
     if not path.is_dir():
         raise NotADirectoryError(path)
     manifests:list[DepotManifest] = []
     depot_keys:dict[int,bytes] = {}
-    for file in path.iterdir():
+    app_id = 0
+    for file in sorted(path.iterdir()):
         if file.is_file():
             if file.suffix == '.manifest':
                 manifests.append(DepotManifest(file.read_bytes()))
             elif file.suffix == '.vdf':
-                with file.open() as f:
-                    d = vdf.load(f)
-                depots = d['depots']
-                for depot_id in depots:
-                    depot_key = depots[depot_id]['DecryptionKey']
-                    depot_keys[int(depot_id)] = unhexlify(depot_key)
+                depot_keys.update(vdf_key_parser(file))
+            elif file.suffix == '.lua':
+                lua_app_id, lua_depot_keys = lua_key_parser(file)
+                app_id = app_id or lua_app_id
+                for depot_id, depot_key in lua_depot_keys.items():
+                    depot_keys.setdefault(depot_id, depot_key) # config.vdf wins
 
-    return manifests,depot_keys
+    log = logging.getLogger(DepotDownloader.__name__)
+    log.info(f"{path.name}: app {app_id or 'unknown'}, {len(manifests)} manifest(s), "
+             f"{len(depot_keys)} depot key(s)")
+
+    return manifests,depot_keys,app_id
 
 
 def main(new_args=None):
     global args
-    if new_args:
-        args = parser.parse_args(new_args)
+    args = parse_args(new_args)
+    setup_logging(args.level)
     paths_in_dir:set[str] = None
     manifests:list[DepotManifest] = []
     depot_keys:dict[int,bytes] = {}
@@ -577,15 +670,29 @@ def main(new_args=None):
         for server in args.server_list:
             server_set.update(server.split(','))
 
-    if args.command == 'app':
-        manifests, depot_keys = app_path_parser(args.app_path)
-        if not save_path:
-            save_path = Path() / (str(args.app_id) if args.app_id else Path(args.app_path).name)
-    elif args.command == 'depot':
-        for manifest_path, depot_key in zip(args.manifest_path_list, args.depot_key_list):
-            manifest = DepotManifest(Path(manifest_path).read_bytes())
-            manifests.append(manifest)
-            depot_keys[manifest.depot_id] = unhexlify(depot_key)
+    try:
+        if args.command == 'app':
+            manifests, depot_keys, dir_app_id = app_path_parser(args.app_path)
+            if not args.app_id:
+                args.app_id = dir_app_id
+            if not save_path:
+                save_path = Path() / (str(args.app_id) if args.app_id else Path(args.app_path).name)
+        elif args.command == 'depot':
+            if len(args.manifest_path_list) != len(args.depot_key_list):
+                parser.error(f'Got {len(args.manifest_path_list)} manifest(s) but '
+                             f'{len(args.depot_key_list)} depot key(s), they must match')
+            for manifest_path, depot_key in zip(args.manifest_path_list, args.depot_key_list):
+                manifest = DepotManifest(Path(manifest_path).read_bytes())
+                manifests.append(manifest)
+                depot_keys[manifest.depot_id] = unhexlify(depot_key)
+
+        keyless_depots = {manifest.depot_id for manifest in manifests} - depot_keys.keys()
+        if keyless_depots:
+            parser.error(f"Depot key not found for depot {', '.join(map(str, sorted(keyless_depots)))}")
+    except (NotADirectoryError, FileNotFoundError, IsADirectoryError) as exp:
+        parser.error(str(exp))
+    except (SteamError, binascii.Error) as exp:
+        parser.error(str(exp))
 
     try:
         cdn = None
@@ -593,6 +700,11 @@ def main(new_args=None):
             client = SteamClient()
             if args.use_websocket:
                 client.connection = WebsocketConnection()
+            # retry is bounded, otherwise the library keeps bootstrapping the cm
+            # server list forever when the api host is unreachable
+            if not client.connect(retry=args.retry):
+                raise SteamError(f'Failed to connect to the cm servers of {DEFAULT_PARAMS["apihost"]}, '
+                                 f'try another --api-host')
             result = client.anonymous_login()
             if result != EResult.OK:
                 raise SteamError(f'Login failure reason: {result.__repr__()}')
@@ -602,7 +714,7 @@ def main(new_args=None):
             depot_key = depot_keys[manifest.depot_id]
             if not save_path:
                 save_path = Path(str(manifest.depot_id))
-            if not paths_in_dir:
+            if paths_in_dir is None:
                 paths_in_dir = {
                     f.relative_to(save_path).as_posix()
                     for f in save_path.rglob('*')
@@ -625,23 +737,23 @@ def main(new_args=None):
     else:
         # show extra files that are not in the manifest
         end = ''
-        if not args.regex_pattern and len(paths_in_dir) != 0:
+        if not args.regex_pattern and paths_in_dir:
             tqdm.write('') # for \n
+            deleted = 0
             for path in sorted(paths_in_dir, key=lambda p: len(Path(p).parts), reverse=True):
                 if args.delete_unmatched:
-                    path = save_path / path
-                    if path.is_symlink() or path.is_file():
-                        path.unlink()
-                    elif path.is_dir():
-                        path.rmdir()
+                    remove_path(save_path / path)
+                    deleted += 1
                 else:
                     tqdm.write(path, end=" ")
 
             if not args.delete_unmatched:
                 tqdm.write('\n') # for \n
                 end = (f", Found {len(paths_in_dir)} entries above in the output directory that are not in the manifest!\n")
+            elif deleted:
+                end = f", Deleted {deleted} entries that are not in the manifest!\n"
 
-        tqdm.write(f'All downloads completed', end=(end or "\n"))
+        tqdm.write('All downloads completed', end=(end or "\n"))
         return
 
 if __name__ == '__main__':

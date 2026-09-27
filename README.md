@@ -11,6 +11,8 @@
         * [目录结构](https://github.com/wxy1343/ManifestAutoUpdate/tree/10)
             * `*.manifest`: 清单文件
             * `config.vdf`: 密钥文件
+        * 没有 `config.vdf` 时,也可以用 `*.lua`(如 [HubcapManifest](https://hubcapmanifest.com/) 的 `{appid}.lua`)里的 `addappid(depot, 1, "密钥")` 提供密钥,两者都有时 `config.vdf` 优先
+        * lua 存在时,第一个 `addappid` 会被当作 appid 用于 cdn token 和默认输出目录
 * `depot`: 单独下载清单
     * `-m, --manifest-path`: 清单文件路径,可指定多个或`空格`分隔
     * `-k, --depot-key`: 仓库密钥,可指定多个或`空格`分隔
@@ -19,6 +21,8 @@
 
 * `python main.py app --app-path ./10`
 * `python main.py depot --manifest-path "368010_6622130648560741481.manifest" --depot-key ef8ea30154f995c4e4226df06f5cc39705ef0fc2d800f948613d1b3dd6b6437e`
+* `python main.py -l app --app-path ./813230`
+    * 私有仓库(如未发售的游戏)需要 `-l` 匿名登录获取 cdn auth token
 
 ## 下载加速
 
